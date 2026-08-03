@@ -30,6 +30,18 @@ interface ScanResponse {
   data: ScanResult;
 }
 
+interface ScannedEntry {
+  time: number;
+  status: 'pending' | 'ok' | 'error';
+  reference: string | null;
+  dispatched: boolean;
+}
+
+const SCAN_INTERVAL_MS = 150;
+const RESCAN_NOTICE_MS = 5000;
+const MAX_SCAN_WIDTH = 640;
+const FEEDBACK_INTERVAL_MS = 1500;
+
 export function PickerScanPage() {
   const navigate = useNavigate();
   const { addScanResult } = useScanHistory();
@@ -39,63 +51,94 @@ export function PickerScanPage() {
   const [scanError, setScanError] = useState<string | null>(null);
   const [scanSuccess, setScanSuccess] = useState(false);
   const [alreadyDispatchedNotice, setAlreadyDispatchedNotice] = useState<string | null>(null);
+  const [alreadyScannedNotice, setAlreadyScannedNotice] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const animFrameRef = useRef<number>(0);
-  
-  const lastScanRef = useRef<{ code: string; time: number } | null>(null);
+  const scanTimerRef = useRef<number | null>(null);
+
+  const detectorRef = useRef<BarcodeDetector | null>(null);
+  const scanInFlightRef = useRef(false);
+  const scannedCodesRef = useRef<Map<string, ScannedEntry>>(new Map());
   const successTimerRef = useRef<number | null>(null);
+  const lastFeedbackRef = useRef<{ code: string; time: number } | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
 
   const isSmallHeight = useMediaQuery('(max-height:680px)');
 
-  const captureFrame = useCallback(() => {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas || video.readyState !== video.HAVE_ENOUGH_DATA) {
-      animFrameRef.current = requestAnimationFrame(captureFrame);
-      return;
-    }
+  const playBeep = useCallback(() => {
+    audioCtxRef.current ??= typeof AudioContext !== 'undefined' ? new AudioContext() : null;
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume().catch(() => undefined);
 
-    const width = video.videoWidth;
-    const height = video.videoHeight;
-    if (width === 0 || height === 0) {
-      animFrameRef.current = requestAnimationFrame(captureFrame);
-      return;
-    }
+    const oscillator = ctx.createOscillator();
+    const gain = ctx.createGain();
+    oscillator.type = 'sine';
+    oscillator.frequency.value = 880;
+    gain.gain.setValueAtTime(0.12, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15);
+    oscillator.connect(gain);
+    gain.connect(ctx.destination);
+    oscillator.start();
+    oscillator.stop(ctx.currentTime + 0.15);
+  }, []);
 
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      animFrameRef.current = requestAnimationFrame(captureFrame);
-      return;
-    }
-
-    ctx.drawImage(video, 0, 0, width, height);
-    const imageData = ctx.getImageData(0, 0, width, height);
-    const code = jsQR(imageData.data, width, height, { inversionAttempts: 'dontInvert' });
-
-    if (code) {
+  const handleDetectedCode = useCallback(
+    (qrData: string) => {
       const now = Date.now();
-      const lastScan = lastScanRef.current;
 
-      if (lastScan && lastScan.code === code.data && now - lastScan.time < 5000) {
-        animFrameRef.current = requestAnimationFrame(captureFrame);
-        return;
+      const lastFeedback = lastFeedbackRef.current;
+      if (
+        !lastFeedback ||
+        lastFeedback.code !== qrData ||
+        now - lastFeedback.time >= FEEDBACK_INTERVAL_MS
+      ) {
+        lastFeedbackRef.current = { code: qrData, time: now };
+        setScanSuccess(true);
+        if (successTimerRef.current) clearTimeout(successTimerRef.current);
+        successTimerRef.current = window.setTimeout(() => setScanSuccess(false), 300);
+        playBeep();
       }
 
-      lastScanRef.current = { code: code.data, time: now };
+      const existing = scannedCodesRef.current.get(qrData);
 
-      setScanSuccess(true);
-      if (successTimerRef.current) clearTimeout(successTimerRef.current);
-      successTimerRef.current = window.setTimeout(() => setScanSuccess(false), 300);
+      if (existing) {
+        if (now - existing.time < RESCAN_NOTICE_MS) return;
+
+        existing.time = now;
+
+        if (existing.status === 'ok') {
+          if (existing.dispatched) {
+            setAlreadyDispatchedNotice(existing.reference ?? 'Etiqueta');
+          } else {
+            setAlreadyScannedNotice(existing.reference ?? 'Etiqueta');
+          }
+          return;
+        }
+
+        existing.status = 'pending';
+      } else {
+        scannedCodesRef.current.set(qrData, {
+          time: now,
+          status: 'pending',
+          reference: null,
+          dispatched: false,
+        });
+      }
 
       httpClient
-        .post('/labels/scan', { qrData: code.data })
+        .post('/labels/scan', { qrData })
         .then(({ data }) => {
           const response = data as ScanResponse;
+          const entry = scannedCodesRef.current.get(qrData);
+          if (entry) {
+            entry.status = 'ok';
+            entry.reference = response.data.externalReference;
+            entry.dispatched = response.data.alreadyDispatched;
+          }
+
           const result: ScanResult = {
             ...response.data,
             scannedAt: new Date().toLocaleTimeString('es-AR'),
@@ -103,7 +146,6 @@ export function PickerScanPage() {
 
           if (result.alreadyDispatched) {
             setAlreadyDispatchedNotice(result.externalReference);
-            setTimeout(() => setAlreadyDispatchedNotice(null), 3500);
             return;
           }
 
@@ -111,20 +153,66 @@ export function PickerScanPage() {
           addScanResult(result);
         })
         .catch((err) => {
+          const entry = scannedCodesRef.current.get(qrData);
+          if (entry) entry.status = 'error';
+
           const msg =
             err?.response?.data?.error?.message ??
             err?.message ??
             'Error al procesar el código QR';
           setScanError(msg);
-          setTimeout(() => setScanError(null), 3500);
         });
+    },
+    [addScanResult, playBeep],
+  );
+
+  const scanFrame = useCallback(() => {
+    const video = videoRef.current;
+    if (!video || video.readyState !== video.HAVE_ENOUGH_DATA) return;
+
+    const detector = detectorRef.current;
+    if (detector) {
+      if (scanInFlightRef.current) return;
+      scanInFlightRef.current = true;
+      detector
+        .detect(video)
+        .then((codes) => {
+          const value = codes[0]?.rawValue;
+          if (value) handleDetectedCode(value);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          scanInFlightRef.current = false;
+        });
+      return;
     }
 
-    animFrameRef.current = requestAnimationFrame(captureFrame);
-  }, [addScanResult]);
+    const canvas = canvasRef.current;
+    const width = video.videoWidth;
+    const height = video.videoHeight;
+    if (!canvas || width === 0 || height === 0) return;
+
+    const scale = Math.min(1, MAX_SCAN_WIDTH / width);
+    const scanWidth = Math.round(width * scale);
+    const scanHeight = Math.round(height * scale);
+
+    canvas.width = scanWidth;
+    canvas.height = scanHeight;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return;
+
+    ctx.drawImage(video, 0, 0, scanWidth, scanHeight);
+    const imageData = ctx.getImageData(0, 0, scanWidth, scanHeight);
+    const code = jsQR(imageData.data, scanWidth, scanHeight, { inversionAttempts: 'dontInvert' });
+
+    if (code) handleDetectedCode(code.data);
+  }, [handleDetectedCode]);
 
   const stopCamera = useCallback(() => {
-    cancelAnimationFrame(animFrameRef.current);
+    if (scanTimerRef.current !== null) {
+      clearInterval(scanTimerRef.current);
+      scanTimerRef.current = null;
+    }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
@@ -138,8 +226,12 @@ export function PickerScanPage() {
     stopCamera();
 
     try {
+      if (!detectorRef.current && 'BarcodeDetector' in window) {
+        detectorRef.current = new BarcodeDetector({ formats: ['qr_code'] });
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
       });
       streamRef.current = stream;
 
@@ -153,17 +245,23 @@ export function PickerScanPage() {
         }
       }
 
-      animFrameRef.current = requestAnimationFrame(captureFrame);
+      scanTimerRef.current = window.setInterval(scanFrame, SCAN_INTERVAL_MS);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'No se pudo acceder a la cámara';
       setCameraError(msg);
     }
-  }, [captureFrame, stopCamera]);
+  }, [scanFrame, stopCamera]);
 
   useEffect(() => {
     startCamera();
     return () => stopCamera();
   }, [startCamera, stopCamera]);
+
+  useEffect(() => {
+    return () => {
+      audioCtxRef.current?.close().catch(() => undefined);
+    };
+  }, []);
 
   const handleFinish = () => {
     stopCamera();
@@ -588,6 +686,17 @@ export function PickerScanPage() {
       >
         <Alert severity="warning" variant="filled" onClose={() => setAlreadyDispatchedNotice(null)}>
           {alreadyDispatchedNotice} ya fue despachada
+        </Alert>
+      </Snackbar>
+
+      <Snackbar
+        open={!!alreadyScannedNotice}
+        autoHideDuration={3500}
+        onClose={() => setAlreadyScannedNotice(null)}
+        anchorOrigin={{ vertical: 'top', horizontal: 'center' }}
+      >
+        <Alert severity="info" variant="filled" onClose={() => setAlreadyScannedNotice(null)}>
+          {alreadyScannedNotice} ya fue escaneada
         </Alert>
       </Snackbar>
     </Box>
